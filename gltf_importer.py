@@ -16,6 +16,12 @@ import sys
 import time
 
 
+# Explicit normals are particularly expensive in 3ds Max because setNormal()
+# creates explicit normal data. For very large meshes, use Max's smoothing
+# calculation instead. Small meshes keep exact glTF normals.
+FAST_EXPLICIT_NORMAL_VERTEX_LIMIT = 100000
+
+
 def _load_legacy_module():
     script_file = globals().get("__file__")
     if not script_file:
@@ -39,8 +45,6 @@ def _load_legacy_module():
         raise ImportError(f"Could not create an import spec for: {legacy_path}")
 
     module = importlib.util.module_from_spec(spec)
-    # Replace any cached copy so re-running the script after editing the legacy
-    # file always loads the version sitting next to this entry point.
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
@@ -48,8 +52,7 @@ def _load_legacy_module():
 
 _legacy = _load_legacy_module()
 
-# Re-export the legacy module's public API so existing usage continues to work:
-# import_file(...), show_ui(), ImportOptions, ImportLog, etc.
+# Re-export the legacy module's public API so existing usage continues to work.
 for _name in dir(_legacy):
     if not _name.startswith("_"):
         globals()[_name] = getattr(_legacy, _name)
@@ -59,8 +62,9 @@ HAS_MAX = _legacy.HAS_MAX
 
 
 if HAS_MAX:
-    # Keep the remaining unavoidable per-normal/per-UV fallback loops inside
-    # MAXScript. This avoids one Python -> MAXScript transition per element.
+    # Compatibility helpers. The normal helper is used only for meshes below
+    # FAST_EXPLICIT_NORMAL_VERTEX_LIMIT; large meshes intentionally skip explicit
+    # normals because this operation is the dominant import bottleneck.
     try:
         rt.execute(r"""
             global GLTFImporter_SetNormalsFast
@@ -84,7 +88,6 @@ if HAS_MAX:
             )
         """)
     except Exception:
-        # Helpers are an optimization only; Python fallbacks below remain valid.
         pass
 
 
@@ -116,6 +119,7 @@ def _create_max_mesh(name, positions, normals, uvs, indices, opts, log, transfor
 
     started = time.perf_counter()
     redraw_disabled = False
+    imported_explicit_normals = False
 
     try:
         try:
@@ -124,8 +128,8 @@ def _create_max_mesh(name, positions, normals, uvs, indices, opts, log, transfor
         except Exception:
             pass
 
-        # Build Python lists of MAXScript Point3 values and cross the pymxs
-        # boundary once for geometry instead of once per vertex/face.
+        # Geometry: build Python lists of MAXScript Point3 values and cross the
+        # pymxs boundary once instead of once per vertex/face.
         max_vertices = []
         append_vert = max_vertices.append
         for pos in positions:
@@ -145,8 +149,8 @@ def _create_max_mesh(name, positions, normals, uvs, indices, opts, log, transfor
         mesh.name = name
         started = _phase(log, f"'{name}' bulk geometry", started)
 
-        # glTF indices address POSITION and TEXCOORD attributes together, so
-        # when counts match the UV face topology is the same as mesh topology.
+        # UVs: glTF indices address POSITION and TEXCOORD together, so when
+        # counts match, map-face topology is identical to geometry topology.
         if uvs and len(uvs) == num_verts:
             max_tverts = [
                 rt.Point3(uv[0], (1.0 - uv[1]) if opts.flip_uvs_v else uv[1], 0.0)
@@ -170,18 +174,29 @@ def _create_max_mesh(name, positions, normals, uvs, indices, opts, log, transfor
                         rt.meshop.setMapVert(mesh, 1, i + 1, uv)
             started = _phase(log, f"'{name}' UVs", started)
 
+        # Exact glTF normals are retained for modest meshes. On large meshes,
+        # setNormal() is pathologically expensive in Max because it creates and
+        # maintains explicit-normal data for each vertex.
         if normals and len(normals) == num_verts:
-            max_normals = []
-            append_normal = max_normals.append
-            for nrm in normals:
-                nx, ny, nz = _legacy._convert_normal(nrm[0], nrm[1], nrm[2], opts)
-                append_normal(rt.Point3(nx, ny, nz))
-            try:
-                rt.GLTFImporter_SetNormalsFast(mesh, max_normals)
-            except Exception:
-                for i, nrm in enumerate(max_normals):
-                    rt.setNormal(mesh, i + 1, nrm)
-            started = _phase(log, f"'{name}' explicit normals", started)
+            if num_verts <= FAST_EXPLICIT_NORMAL_VERTEX_LIMIT:
+                normal_start = time.perf_counter()
+                max_normals = []
+                append_normal = max_normals.append
+                for nrm in normals:
+                    nx, ny, nz = _legacy._convert_normal(nrm[0], nrm[1], nrm[2], opts)
+                    append_normal(rt.Point3(nx, ny, nz))
+                try:
+                    rt.GLTFImporter_SetNormalsFast(mesh, max_normals)
+                except Exception:
+                    for i, nrm in enumerate(max_normals):
+                        rt.setNormal(mesh, i + 1, nrm)
+                imported_explicit_normals = True
+                _phase(log, f"'{name}' explicit normals", normal_start)
+            else:
+                log.warn(
+                    f"'{name}': Skipping {num_verts} explicit glTF normals in fast mode "
+                    f"(limit {FAST_EXPLICIT_NORMAL_VERTEX_LIMIT}); using Auto-Smooth instead"
+                )
 
         if transform:
             _legacy._apply_node_transform(mesh, transform, opts)
@@ -220,24 +235,26 @@ def _create_max_mesh(name, positions, normals, uvs, indices, opts, log, transfor
                 log.warn(f"Weld failed on '{name}': {e}")
             _phase(log, f"'{name}' weld", weld_start)
 
-        if opts.auto_smooth and not normals:
+        # If exact normals were skipped, apply Max's native angle-based smoothing.
+        # This keeps the fast path visually useful without building 500k+ explicit
+        # normal records.
+        if opts.auto_smooth and not imported_explicit_normals:
+            smooth_start = time.perf_counter()
             try:
                 rt.addModifier(mesh, rt.Smooth(autoSmooth=True, threshold=opts.smooth_angle))
-            except Exception:
-                pass
+                _phase(log, f"'{name}' auto-smooth", smooth_start)
+            except Exception as e:
+                log.warn(f"Auto-Smooth failed on '{name}': {e}")
 
-        # Preserve the original topology behavior. This phase is timed because
-        # Turn_to_Poly quad reconstruction can dominate very large imports.
+        # GLTF primitive mode 4 is already triangles. For the Triangles option,
+        # Turn_to_Poly(maxPolySize=3) is redundant and very expensive on large
+        # meshes; convert directly to Editable Poly instead.
         if opts.topology != 'mesh':
             topo_start = time.perf_counter()
             try:
                 if opts.topology == 'triangles':
-                    ttp = rt.Turn_to_Poly()
-                    ttp.limitPolySize = True
-                    ttp.maxPolySize = 3
-                    rt.addModifier(mesh, ttp)
                     rt.convertToPoly(mesh)
-                    log.info(f"'{name}': Editable Poly (triangles)")
+                    log.info(f"'{name}': Editable Poly (triangles, fast conversion)")
                 elif opts.topology == 'quads':
                     ttp = rt.Turn_to_Poly()
                     ttp.limitPolySize = True
