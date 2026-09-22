@@ -1,5 +1,6 @@
 name: Build single-file importer
 
+# Regenerate gltf_importer.py whenever the single-file builder changes.
 on:
   push:
     branches:
