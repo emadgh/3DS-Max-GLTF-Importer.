@@ -4,20 +4,63 @@ Performance-oriented entry point for GLTF Importer for 3ds Max.
 This module preserves the public API/UI from gltf_importer_legacy.py and replaces
 only the mesh-construction hot path. Geometry is sent to MAXScript in bulk rather
 than issuing a pymxs call for every vertex/face/UV/normal.
+
+The legacy module is loaded explicitly from the directory containing this file.
+This is important in 3ds Max because Run Script / Script Editor execution does not
+always add the script directory to Python's sys.path.
 """
 
+import importlib.util
+import os
+import sys
 import time
 
-from gltf_importer_legacy import *  # noqa: F401,F403
-import gltf_importer_legacy as _legacy
+
+def _load_legacy_module():
+    script_file = globals().get("__file__")
+    if not script_file:
+        raise RuntimeError(
+            "3ds Max did not provide __file__. Please run gltf_importer.py with "
+            "Scripting > Run Script instead of pasting its contents into the console."
+        )
+
+    script_dir = os.path.dirname(os.path.abspath(script_file))
+    legacy_path = os.path.join(script_dir, "gltf_importer_legacy.py")
+
+    if not os.path.isfile(legacy_path):
+        raise FileNotFoundError(
+            "gltf_importer_legacy.py was not found beside gltf_importer.py.\n"
+            f"Expected: {legacy_path}"
+        )
+
+    module_name = "_gltf_importer_legacy_local"
+    spec = importlib.util.spec_from_file_location(module_name, legacy_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not create an import spec for: {legacy_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    # Replace any cached copy so re-running the script after editing the legacy
+    # file always loads the version sitting next to this entry point.
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_legacy = _load_legacy_module()
+
+# Re-export the legacy module's public API so existing usage continues to work:
+# import_file(...), show_ui(), ImportOptions, ImportLog, etc.
+for _name in dir(_legacy):
+    if not _name.startswith("_"):
+        globals()[_name] = getattr(_legacy, _name)
 
 rt = _legacy.rt
 HAS_MAX = _legacy.HAS_MAX
 
 
 if HAS_MAX:
-    # Keep the remaining unavoidable per-normal fallback loop inside MAXScript.
-    # This avoids one Python -> MAXScript transition per normal.
+    # Keep the remaining unavoidable per-normal/per-UV fallback loops inside
+    # MAXScript. This avoids one Python -> MAXScript transition per element.
     try:
         rt.execute(r"""
             global GLTFImporter_SetNormalsFast
@@ -75,14 +118,14 @@ def _create_max_mesh(name, positions, normals, uvs, indices, opts, log, transfor
     redraw_disabled = False
 
     try:
-        # Avoid repeated viewport invalidation while the mesh is being assembled.
         try:
             rt.disableSceneRedraw()
             redraw_disabled = True
         except Exception:
             pass
 
-        # Build MAXScript values in Python, then cross the pymxs boundary once.
+        # Build Python lists of MAXScript Point3 values and cross the pymxs
+        # boundary once for geometry instead of once per vertex/face.
         max_vertices = []
         append_vert = max_vertices.append
         for pos in positions:
@@ -102,26 +145,23 @@ def _create_max_mesh(name, positions, normals, uvs, indices, opts, log, transfor
         mesh.name = name
         started = _phase(log, f"'{name}' bulk geometry", started)
 
-        # GLTF indices address all vertex attributes together, so when UV count
-        # matches POSITION count the UV face topology is identical to geometry.
+        # glTF indices address POSITION and TEXCOORD attributes together, so
+        # when counts match the UV face topology is the same as mesh topology.
         if uvs and len(uvs) == num_verts:
             max_tverts = [
                 rt.Point3(uv[0], (1.0 - uv[1]) if opts.flip_uvs_v else uv[1], 0.0)
                 for uv in uvs
             ]
             try:
-                # Build map faces in one native call, then replace all tverts in
-                # one setMesh call. This avoids per-face and per-UV pymxs calls.
                 rt.meshop.setNumMaps(mesh, 2, keep=True)
                 rt.meshop.setMapSupport(mesh, 1, True)
                 rt.meshop.defaultMapFaces(mesh, 1)
                 rt.setMesh(mesh, tverts=max_tverts)
             except Exception:
-                # Compatibility fallback: still only one Python -> MAXScript call;
-                # the per-UV loop executes inside MAXScript.
                 try:
                     rt.GLTFImporter_SetUVsFast(mesh, max_tverts)
                 except Exception:
+                    # Last-resort compatibility path for older Max versions.
                     rt.meshop.setNumMaps(mesh, 2)
                     rt.meshop.setMapSupport(mesh, 1, True)
                     rt.meshop.setNumMapVerts(mesh, 1, num_verts)
@@ -130,8 +170,6 @@ def _create_max_mesh(name, positions, normals, uvs, indices, opts, log, transfor
                         rt.meshop.setMapVert(mesh, 1, i + 1, uv)
             started = _phase(log, f"'{name}' UVs", started)
 
-        # Preserve explicit GLTF normals. There is no equivalent documented bulk
-        # setNormal call, so run the loop on the MAXScript side when possible.
         if normals and len(normals) == num_verts:
             max_normals = []
             append_normal = max_normals.append
@@ -188,8 +226,8 @@ def _create_max_mesh(name, positions, normals, uvs, indices, opts, log, transfor
             except Exception:
                 pass
 
-        # Keep the original topology semantics. This phase is timed separately
-        # because quad reconstruction can dominate very large imports.
+        # Preserve the original topology behavior. This phase is timed because
+        # Turn_to_Poly quad reconstruction can dominate very large imports.
         if opts.topology != 'mesh':
             topo_start = time.perf_counter()
             try:
@@ -233,7 +271,9 @@ def _create_max_mesh(name, positions, normals, uvs, indices, opts, log, transfor
                 pass
 
 
-# Patch the implementation used by functions defined in the legacy module.
+# Functions such as import_file() were defined in the legacy module and resolve
+# _create_max_mesh from that module's globals. Replace that symbol with our fast
+# implementation so both the UI and public API automatically use it.
 _legacy._create_max_mesh = _create_max_mesh
 
 
