@@ -1,9 +1,10 @@
 """
 GLTF Importer for 3ds Max
-Version: 0.3.0
+Version: 0.4.0-fast-single
 Author: Richard Throgmorton
 
 Imports GLTF/GLB files into 3ds Max with geometry and PBR materials.
+Single-file fast build with bulk large-mesh construction and reusable UI.
 Features: Multi-file import, orientation options, mesh integrity checks,
           error detection, DPI-aware WinForms UI, Editable Poly output,
           and multi-renderer material support (Physical, V-Ray, Corona, Arnold).
@@ -23,6 +24,7 @@ import os
 import base64
 import math
 import traceback
+import time
 
 try:
     import pymxs
@@ -55,7 +57,7 @@ class ImportOptions:
         self.flip_normals = False
         self.flip_uvs_v = True
         self.remove_degenerates = True
-        self.topology = 'quads'  # 'triangles', 'quads', 'ngons'
+        self.topology = 'triangles'  # 'triangles', 'quads', 'ngons'
 
         # Materials
         self.import_materials = True
@@ -530,7 +532,45 @@ def _validate_mesh_data(mesh_name, positions, normals, uvs, indices, opts, log):
 # 3DS MAX MESH BUILDER
 # ============================================================================
 
+# Large-mesh performance tuning.
+FAST_EXPLICIT_NORMAL_VERTEX_LIMIT = 100000
+
+if HAS_MAX:
+    try:
+        rt.execute(r"""
+            global GLTFImporter_SetNormalsFast
+            fn GLTFImporter_SetNormalsFast obj normalArray =
+            (
+                local n = normalArray.count
+                if n > obj.numverts do n = obj.numverts
+                for i = 1 to n do setNormal obj i normalArray[i]
+            )
+
+            global GLTFImporter_SetUVsFast
+            fn GLTFImporter_SetUVsFast obj uvArray =
+            (
+                meshop.setNumMaps obj 2 keep:true
+                meshop.setMapSupport obj 1 true
+                meshop.defaultMapFaces obj 1
+                local n = uvArray.count
+                local mapCount = meshop.getNumMapVerts obj 1
+                if n > mapCount do n = mapCount
+                for i = 1 to n do meshop.setMapVert obj 1 i uvArray[i]
+            )
+        """)
+    except Exception:
+        pass
+
+
+def _phase(log, name, started):
+    elapsed = time.perf_counter() - started
+    log.info(f"{name}: {elapsed:.2f}s")
+    log.flush()
+    return time.perf_counter()
+
+
 def _create_max_mesh(name, positions, normals, uvs, indices, opts, log, transform=None):
+    """Create a 3ds Max mesh using bulk pymxs/MAXScript operations."""
     scale = opts.get_scale_value()
 
     if not HAS_MAX:
@@ -538,148 +578,180 @@ def _create_max_mesh(name, positions, normals, uvs, indices, opts, log, transfor
         log.mesh_count += 1
         return None
 
-    # Full validation
     indices = _validate_mesh_data(name, positions, normals, uvs, indices, opts, log)
     if indices is None:
         return None
 
     num_verts = len(positions)
     num_faces = len(indices) // 3
-
     if num_verts == 0 or num_faces == 0:
         log.warn(f"Skipping empty mesh '{name}'")
         return None
 
+    started = time.perf_counter()
+    redraw_disabled = False
+    imported_explicit_normals = False
+
     try:
-        mesh = rt.Mesh()
-        mesh.name = name
-    except Exception as e:
-        log.error(f"Failed to create mesh '{name}': {e}")
-        return None
+        try:
+            rt.disableSceneRedraw()
+            redraw_disabled = True
+        except Exception:
+            pass
 
-    rt.setNumVerts(mesh, num_verts)
-    rt.setNumFaces(mesh, num_faces)
+        max_vertices = []
+        append_vert = max_vertices.append
+        for pos in positions:
+            cx, cy, cz = _convert_position(pos[0], pos[1], pos[2], opts)
+            append_vert(rt.Point3(cx * scale, cy * scale, cz * scale))
 
-    # Vertices with coordinate conversion
-    for i, pos in enumerate(positions):
-        cx, cy, cz = _convert_position(pos[0], pos[1], pos[2], opts)
-        rt.setVert(mesh, i + 1, rt.Point3(cx * scale, cy * scale, cz * scale))
-
-    # Faces (1-indexed)
-    for i in range(num_faces):
-        v1 = indices[i * 3] + 1
-        v2 = indices[i * 3 + 1] + 1
-        v3 = indices[i * 3 + 2] + 1
+        max_faces = []
+        append_face = max_faces.append
         if opts.flip_normals:
-            v2, v3 = v3, v2
-        rt.setFace(mesh, i + 1, rt.Point3(v1, v2, v3))
+            for i in range(0, num_faces * 3, 3):
+                append_face(rt.Point3(indices[i] + 1, indices[i + 2] + 1, indices[i + 1] + 1))
+        else:
+            for i in range(0, num_faces * 3, 3):
+                append_face(rt.Point3(indices[i] + 1, indices[i + 1] + 1, indices[i + 2] + 1))
 
-    # UVs via meshop
-    if uvs and len(uvs) == num_verts:
-        try:
-            rt.meshop.setNumMaps(mesh, 2)
-            rt.meshop.setMapSupport(mesh, 1, True)
-            rt.meshop.setNumMapVerts(mesh, 1, num_verts)
-            rt.meshop.setNumMapFaces(mesh, 1, num_faces)
-            for i, uv in enumerate(uvs):
-                u = uv[0]
-                v = (1.0 - uv[1]) if opts.flip_uvs_v else uv[1]
-                rt.meshop.setMapVert(mesh, 1, i + 1, rt.Point3(u, v, 0.0))
-            for i in range(num_faces):
-                v1 = indices[i * 3] + 1
-                v2 = indices[i * 3 + 1] + 1
-                v3 = indices[i * 3 + 2] + 1
-                if opts.flip_normals:
-                    v2, v3 = v3, v2
-                rt.meshop.setMapFace(mesh, 1, i + 1, rt.Point3(v1, v2, v3))
-        except Exception as e:
-            log.warn(f"Failed to set UVs on '{name}': {e}")
+        mesh = rt.mesh(vertices=max_vertices, faces=max_faces)
+        mesh.name = name
+        started = _phase(log, f"'{name}' bulk geometry", started)
 
-    # Per-vertex normals from GLTF data
-    if normals and len(normals) == num_verts:
-        for i, nrm in enumerate(normals):
-            nx, ny, nz = _convert_normal(nrm[0], nrm[1], nrm[2], opts)
-            rt.setNormal(mesh, i + 1, rt.Point3(nx, ny, nz))
-
-    # Node transform
-    if transform:
-        _apply_node_transform(mesh, transform, opts)
-
-    rt.update(mesh)
-
-    # Diagnostic: verify face count after update
-    try:
-        actual_faces = rt.getNumFaces(mesh)
-        actual_verts = rt.getNumVerts(mesh)
-        if actual_faces != num_faces:
-            log.warn(f"'{name}': Expected {num_faces} faces, Max reports {actual_faces}")
-        log.info(f"'{name}': Created {actual_verts} verts, {actual_faces} faces")
-    except Exception:
-        pass
-
-    # Disable backface culling
-    try:
-        mesh.backfacecull = False
-    except Exception:
-        try:
-            rt.setProperty(mesh, "backfacecull", False)
-        except Exception:
-            pass
-
-    # Weld vertices
-    if opts.weld_vertices:
-        try:
-            before = rt.getNumVerts(mesh)
-            rt.meshop.weldVertsByThreshold(mesh, rt.getNumVerts(mesh), opts.weld_threshold)
-            after = rt.getNumVerts(mesh)
-            welded = before - after
-            if welded > 0:
-                log.weld_count += welded
-                log.info(f"Welded {welded} vertices on '{name}'")
-        except Exception as e:
-            log.warn(f"Weld failed on '{name}': {e}")
-
-    # Auto-smooth (only when no explicit normals — avoids conflicts)
-    if opts.auto_smooth and not normals:
-        try:
-            rt.addModifier(mesh, rt.Smooth(autoSmooth=True, threshold=opts.smooth_angle))
-        except Exception:
-            pass
-
-    # Convert to Editable Poly with topology control
-    if opts.topology != 'mesh':
-        try:
-            if opts.topology == 'triangles':
-                # Turn_to_Poly with max 3 sides keeps triangles
-                ttp = rt.Turn_to_Poly()
-                ttp.limitPolySize = True
-                ttp.maxPolySize = 3
-                rt.addModifier(mesh, ttp)
-                rt.convertToPoly(mesh)
-                log.info(f"'{name}': Editable Poly (triangles)")
-            elif opts.topology == 'quads':
-                # Turn_to_Poly with max 4 sides merges tri pairs into quads
-                ttp = rt.Turn_to_Poly()
-                ttp.limitPolySize = True
-                ttp.maxPolySize = 4
-                rt.addModifier(mesh, ttp)
-                rt.convertToPoly(mesh)
-                log.info(f"'{name}': Editable Poly (quads)")
-            else:
-                # N-gons: straight conversion, merges coplanar faces freely
-                rt.convertToPoly(mesh)
-                log.info(f"'{name}': Editable Poly (n-gons)")
-        except Exception as e:
-            log.warn(f"Failed topology conversion on '{name}': {e}")
-            # Fallback: try simple convertToPoly
+        if uvs and len(uvs) == num_verts:
+            max_tverts = [
+                rt.Point3(uv[0], (1.0 - uv[1]) if opts.flip_uvs_v else uv[1], 0.0)
+                for uv in uvs
+            ]
             try:
-                rt.convertToPoly(mesh)
+                rt.meshop.setNumMaps(mesh, 2, keep=True)
+                rt.meshop.setMapSupport(mesh, 1, True)
+                rt.meshop.defaultMapFaces(mesh, 1)
+                rt.setMesh(mesh, tverts=max_tverts)
+            except Exception:
+                try:
+                    rt.GLTFImporter_SetUVsFast(mesh, max_tverts)
+                except Exception:
+                    rt.meshop.setNumMaps(mesh, 2)
+                    rt.meshop.setMapSupport(mesh, 1, True)
+                    rt.meshop.setNumMapVerts(mesh, 1, num_verts)
+                    rt.meshop.defaultMapFaces(mesh, 1)
+                    for i, uv in enumerate(max_tverts):
+                        rt.meshop.setMapVert(mesh, 1, i + 1, uv)
+            started = _phase(log, f"'{name}' UVs", started)
+
+        if normals and len(normals) == num_verts:
+            if num_verts <= FAST_EXPLICIT_NORMAL_VERTEX_LIMIT:
+                normal_start = time.perf_counter()
+                max_normals = []
+                append_normal = max_normals.append
+                for nrm in normals:
+                    nx, ny, nz = _convert_normal(nrm[0], nrm[1], nrm[2], opts)
+                    append_normal(rt.Point3(nx, ny, nz))
+                try:
+                    rt.GLTFImporter_SetNormalsFast(mesh, max_normals)
+                except Exception:
+                    for i, nrm in enumerate(max_normals):
+                        rt.setNormal(mesh, i + 1, nrm)
+                imported_explicit_normals = True
+                _phase(log, f"'{name}' explicit normals", normal_start)
+            else:
+                log.warn(
+                    f"'{name}': Skipping {num_verts} explicit glTF normals in fast mode "
+                    f"(limit {FAST_EXPLICIT_NORMAL_VERTEX_LIMIT}); using Auto-Smooth instead"
+                )
+
+        if transform:
+            _apply_node_transform(mesh, transform, opts)
+
+        rt.update(mesh)
+        started = _phase(log, f"'{name}' mesh update", started)
+
+        try:
+            actual_faces = rt.getNumFaces(mesh)
+            actual_verts = rt.getNumVerts(mesh)
+            if actual_faces != num_faces:
+                log.warn(f"'{name}': Expected {num_faces} faces, Max reports {actual_faces}")
+            log.info(f"'{name}': Created {actual_verts} verts, {actual_faces} faces")
+        except Exception:
+            pass
+
+        try:
+            mesh.backfacecull = False
+        except Exception:
+            try:
+                rt.setProperty(mesh, "backfacecull", False)
             except Exception:
                 pass
 
-    log.mesh_count += 1
-    log.flush()
-    return mesh
+        if opts.weld_vertices:
+            weld_start = time.perf_counter()
+            try:
+                before = rt.getNumVerts(mesh)
+                rt.meshop.weldVertsByThreshold(mesh, rt.getNumVerts(mesh), opts.weld_threshold)
+                after = rt.getNumVerts(mesh)
+                welded = before - after
+                if welded > 0:
+                    log.weld_count += welded
+                    log.info(f"Welded {welded} vertices on '{name}'")
+            except Exception as e:
+                log.warn(f"Weld failed on '{name}': {e}")
+            _phase(log, f"'{name}' weld", weld_start)
+
+        if opts.auto_smooth and not imported_explicit_normals:
+            smooth_start = time.perf_counter()
+            try:
+                rt.addModifier(mesh, rt.Smooth(autoSmooth=True, threshold=opts.smooth_angle))
+                _phase(log, f"'{name}' auto-smooth", smooth_start)
+            except Exception as e:
+                log.warn(f"Auto-Smooth failed on '{name}': {e}")
+
+        if opts.topology != 'mesh':
+            topo_start = time.perf_counter()
+            try:
+                if opts.topology == 'triangles':
+                    # glTF mode 4 is already triangles. Do not run Turn_to_Poly
+                    # merely to recreate the topology we already have.
+                    rt.convertToPoly(mesh)
+                    log.info(f"'{name}': Editable Poly (triangles, fast conversion)")
+                elif opts.topology == 'quads':
+                    ttp = rt.Turn_to_Poly()
+                    ttp.limitPolySize = True
+                    ttp.maxPolySize = 4
+                    rt.addModifier(mesh, ttp)
+                    rt.convertToPoly(mesh)
+                    log.info(f"'{name}': Editable Poly (quads)")
+                else:
+                    rt.convertToPoly(mesh)
+                    log.info(f"'{name}': Editable Poly (n-gons)")
+            except Exception as e:
+                log.warn(f"Failed topology conversion on '{name}': {e}")
+                try:
+                    rt.convertToPoly(mesh)
+                except Exception:
+                    pass
+            _phase(log, f"'{name}' topology conversion", topo_start)
+
+        log.mesh_count += 1
+        log.flush()
+        return mesh
+
+    except Exception as e:
+        log.error(f"Failed to create mesh '{name}': {e}")
+        return None
+    finally:
+        if redraw_disabled:
+            try:
+                rt.enableSceneRedraw()
+            except Exception:
+                pass
+        try:
+            rt.redrawViews()
+        except Exception:
+            try:
+                rt.completeRedraw()
+            except Exception:
+                pass
 
 
 def _apply_node_transform(node, transform, opts):
@@ -1497,6 +1569,9 @@ def import_folder(folder_path, scale=1.0, recursive=False):
 # DPI-AWARE WINFORMS UI
 # ============================================================================
 
+_UI_KEEPALIVE = []
+
+
 def show_ui():
     if not HAS_MAX:
         print("Error: Must be run from 3ds Max")
@@ -1693,7 +1768,7 @@ def _build_ui():
 
     make_label(mesh_group, "Topology:", S(350), S(25))
     cmb_topology = make_combo(mesh_group, ["Triangles", "Quads", "N-Gons"], S(420), S(22), S(130))
-    cmb_topology.SelectedIndex = 1  # Default to Quads
+    cmb_topology.SelectedIndex = 0  # Default to Triangles (native glTF topology / fast path)
 
     chk_smooth = make_check(mesh_group, "Auto-Smooth", S(10), S(55), checked=True)
     chk_degen = make_check(mesh_group, "Remove Degenerates", S(150), S(55), checked=True)
@@ -1874,6 +1949,9 @@ def _build_ui():
 
         filepaths = list(_file_paths)
 
+        btn_import.Enabled = False
+        form.UseWaitCursor = True
+
         lbl_status.Text = f"Importing {count} file(s)..."
         lbl_status.ForeColor = Color.FromArgb(220, 200, 120)
         txt_log.Text = ""
@@ -1897,6 +1975,27 @@ def _build_ui():
             txt_log.AppendText(f"\r\nFATAL ERROR:\r\n{traceback.format_exc()}")
             lbl_status.Text = "Import failed with errors."
             lbl_status.ForeColor = Color.FromArgb(220, 80, 80)
+        finally:
+            # 3ds Max can temporarily disable an owned WinForms window while
+            # executing synchronous scene operations. Always restore it here.
+            try:
+                form.Enabled = True
+                btn_import.Enabled = True
+                form.UseWaitCursor = False
+                txt_custom.Enabled = (cmb_scale.SelectedIndex == 3)
+            except Exception:
+                pass
+            try:
+                rt.enableSceneRedraw()
+                rt.redrawViews()
+            except Exception:
+                pass
+            try:
+                form.Refresh()
+                form.Activate()
+                rt.dotNetClass("System.Windows.Forms.Application").DoEvents()
+            except Exception:
+                pass
 
     def on_close(*args):
         form.Close()
@@ -1909,6 +2008,21 @@ def _build_ui():
     rt.dotNet.addEventHandler(cmb_scale, "SelectedIndexChanged", on_scale_change)
     rt.dotNet.addEventHandler(btn_import, "Click", on_import)
     rt.dotNet.addEventHandler(btn_close, "Click", on_close)
+
+    # Strong references for the .NET event bridge / callbacks.
+    global _UI_KEEPALIVE
+    try:
+        _UI_KEEPALIVE[:] = [
+            item for item in _UI_KEEPALIVE
+            if item[0] is not None and not item[0].IsDisposed
+        ]
+    except Exception:
+        _UI_KEEPALIVE[:] = []
+    _UI_KEEPALIVE.append((
+        form,
+        on_add_files, on_add_folder, on_remove, on_clear,
+        on_scale_change, on_import, on_close,
+    ))
 
     # Show and parent to Max window
     form.Show()
